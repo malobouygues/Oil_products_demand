@@ -1,7 +1,8 @@
-"""From the two DuckDB tables to one modelling frame per product.
+"""From the clean DuckDB tables to one point-in-time modelling frame per product.
 
-    dataset("gasoline")  ->  one row per month: demand, then every driver as it was readable at
-                             that month end
+    python -m src.data   ->  table panel: one row per product, month and driver, with the value
+                             readable at that month end and the two dates that prove it
+    dataset("gasoline")  ->  the same panel as a frame, one row per month: demand, then drivers
 
 Every driver observation carries two dates. period_end is the last day of the period the number
 describes; available_at is the day it was published, period_end plus the source's lag. Truck
@@ -9,6 +10,10 @@ tonnage for July is not out until October and must not appear in an August or Se
 so the join is merge_asof backward on available_at: as of each month end, the most recent value
 already published. Drivers become step functions rather than smooth lines, which costs a tree
 nothing.
+
+The lags are release-calendar conventions applied to today's figures. They stop a number from
+being used before it existed; they do not undo later revisions, because the sources publish no
+history of vintages.
 """
 
 import pandas as pd
@@ -40,25 +45,49 @@ def predictors(product):
     return series
 
 
-def dataset(product):
-    """Demand joined to every driver published by each month end, on a complete monthly index so
-    a gap in a source shows as a gap and not as a missing row. The index runs to the latest
-    origin: the month end by which the last demand figure was published."""
-    df = demand(product)
-    last_origin = df.index.max() + pd.DateOffset(months=c.DEMAND_LAG[product])
-    df = df.reindex(pd.date_range(c.SAMPLE_START, last_origin, freq="MS", name="month"))
-    df = df.reset_index()
+def align(product):
+    """Every driver as it was readable at each month end, in long form, on a complete monthly
+    index so a gap in a source shows as a missing value and not as a missing row. The index
+    runs to the latest origin: the month end by which the last demand figure was published."""
+    last_origin = demand(product).index.max() + pd.DateOffset(months=c.DEMAND_LAG[product])
+    months = pd.DataFrame({"month": pd.date_range(c.SAMPLE_START, last_origin, freq="MS")})
     # the forecast origin: whatever was published by the last day of the month
-    df["month_end"] = df["month"] + pd.offsets.MonthEnd(0)
+    months["month_end"] = months["month"] + pd.offsets.MonthEnd(0)
+
+    frames = []
     for name, s in predictors(product).items():
-        s = s.dropna().rename(name).reset_index()
+        s = s.dropna().rename("value").reset_index()
         if name == "product_supplied_4wk":
             s["available_at"] = s["period_end"] + pd.Timedelta(days=c.WEEKLY_LAG_DAYS)
         else:
             s["available_at"] = s["period_end"] + pd.offsets.MonthEnd(c.LAG[name])
         s = s.sort_values("available_at")
-        df = pd.merge_asof(df, s[["available_at", name]], left_on="month_end",
-                           right_on="available_at", direction="backward",
-                           tolerance=pd.Timedelta(days=c.STALE_DAYS))
-        df = df.drop(columns="available_at")
-    return df.drop(columns="month_end").set_index("month")
+        df = pd.merge_asof(months, s, left_on="month_end", right_on="available_at",
+                           direction="backward", tolerance=pd.Timedelta(days=c.STALE_DAYS))
+        df.insert(0, "variable", name)
+        frames.append(df)
+    df = pd.concat(frames, ignore_index=True)
+    df.insert(0, "product", product)
+    return df
+
+
+def dataset(product):
+    """The stored panel of one product as the modelling frame: demand, then every driver as
+    readable at that month end. Trailing rows without demand are the latest forecast origins."""
+    panel = sql.query(f"SELECT month, variable, value FROM panel WHERE product = '{product}'")
+    df = panel.pivot(index="month", columns="variable", values="value")
+    df.columns.name = None
+    df.insert(0, "demand", demand(product)["demand"])
+    return df
+
+
+def build():
+    """Align every product and store the result as the table panel."""
+    panel = pd.concat([align(product) for product in c.DEMAND_LAG], ignore_index=True)
+    sql.write("panel", panel)
+    return sql.query("SELECT product, COUNT(DISTINCT variable) AS drivers, MIN(month) AS first, "
+                     "MAX(month) AS last, COUNT(*) AS rows FROM panel GROUP BY 1 ORDER BY 1")
+
+
+if __name__ == "__main__":
+    print(build())

@@ -5,7 +5,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 DB = DATA / "oil.duckdb"
-RESULTS = ROOT / "results"  # backtests written by python -m src.model, read by notebook 02
 
 # raw files, one folder per product
 GASOLINE = DATA / "US_gasoline"
@@ -33,15 +32,15 @@ LAG = {
     "cargo": 1,
     "tankers": 1,
     "wtr": 2,              # CPB, around the 25th of the second month after
-    "brent": 0,            # a monthly average of daily prices, known at month end
 }
 # EIA's Weekly Petroleum Status Report: the Wednesday after the Friday that ends the week,
 # Thursday in holiday weeks
 WEEKLY_LAG_DAYS = 6
 
 # Past this a value is stale rather than late: it goes missing, which XGBoost handles and which
-# is honest about a series that has stopped publishing.
-STALE_DAYS = 730
+# is honest about a series that has stopped publishing. The slowest driver is three months
+# late, 92 days at most: 125 days leaves room for one skipped release and no more.
+STALE_DAYS = 125
 
 # --- the sample and the experiment ---------------------------------------------
 # From 2000 every driver exists, except MPA's tanker arrivals (2002)
@@ -51,5 +50,7 @@ SAMPLE_START = "2000-01-01"
 TRAIN_START = "2001-01-01"
 # The backtest forecasts from every month end since 2015, fourteen years of training data in.
 BACKTEST_START = "2015-01-01"
-# 2020 is a shock, not a pattern to learn: no origin, target or naive reference month in it.
+# 2020 is a shock, not a pattern to learn: no training row has its origin, target or naive
+# reference month in it. The backtest still forecasts through it; the headline scores leave
+# those forecasts out and notebook 02 shows them separately.
 EXCLUDE_YEARS = [2020]

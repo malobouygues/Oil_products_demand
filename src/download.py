@@ -36,8 +36,7 @@ EIA = {c.GASOLINE: {"monthly": {"MGFUPUS2": "product_supplied", "MGFEXUS2": "exp
 FRED = {c.GASOLINE: {"TRFVOLUSM227NFWA": "vmt", "PAYEMS": "payrolls", "DSPIC96": "inc",
                      "CPIAUCSL": "cpi"},
         c.DISTILLATE: {"INDPRO": "ind", "IPMAN": "ind_manuf", "TRUCKD11": "truck",
-                       "CPIAUCSL": "cpi"},
-        c.BUNKER: {"POILBREUSDM": "brent"}}
+                       "CPIAUCSL": "cpi"}}
 
 NOAA = ("https://ftp.cpc.ncep.noaa.gov/htdocs/products/analysis_monitoring/cdus/degree_days/"
         "archives/Heating%20degree%20Days/monthly%20states/")

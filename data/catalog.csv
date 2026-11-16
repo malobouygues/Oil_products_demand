@@ -1,0 +1,27 @@
+product,variable,source,source_id,definition,unit,frequency,date_stamp,release
+gasoline,demand,EIA Petroleum Supply Monthly,MGFUPUS2,Finished motor gasoline product supplied,kb/d,monthly,15th of the month,end of the second month after
+gasoline,exports,EIA Petroleum Supply Monthly,MGFEXUS2,Finished motor gasoline exports (context only),kb/d,monthly,15th of the month,end of the second month after
+gasoline,retail_price,EIA Gasoline and Diesel Fuel Update,EMM_EPMR_PTE_NUS_DPG,Regular gasoline retail price,USD/gal,monthly,15th of the month,weekly survey so known at month end
+gasoline,product_supplied_weekly,EIA Weekly Petroleum Status Report,WGFUPUS2,Finished motor gasoline product supplied (weekly estimate),kb/d,weekly,Friday ending the week,Wednesday after the week
+gasoline,stocks,EIA Weekly Petroleum Status Report,WGTSTUS1,Total gasoline stocks (context only),thousand barrels,weekly,Friday ending the week,Wednesday after the week
+gasoline,vmt,FHWA Traffic Volume Trends via FRED,TRFVOLUSM227NFWA,Vehicle miles travelled (not seasonally adjusted),million miles,monthly,1st of the month,about five weeks after the month
+gasoline,payrolls,BLS Employment Situation via FRED,PAYEMS,Total nonfarm payrolls (seasonally adjusted),thousand persons,monthly,1st of the month,first Friday of the following month
+gasoline,inc,BEA Personal Income and Outlays via FRED,DSPIC96,Real disposable personal income (seasonally adjusted annual rate),billion chained 2017 USD,monthly,1st of the month,end of the following month
+gasoline,cpi,BLS Consumer Price Index via FRED,CPIAUCSL,CPI all urban consumers all items (seasonally adjusted),index 1982-84=100,monthly,1st of the month,mid following month
+distillate,demand,EIA Petroleum Supply Monthly,MDIUPUS2,Distillate fuel oil product supplied,kb/d,monthly,15th of the month,end of the second month after
+distillate,exports,EIA Petroleum Supply Monthly,MDIEXUS2,Distillate fuel oil exports (context only),kb/d,monthly,15th of the month,end of the second month after
+distillate,retail_price,EIA Gasoline and Diesel Fuel Update,EMD_EPD2D_PTE_NUS_DPG,No 2 diesel retail price,USD/gal,monthly,15th of the month,weekly survey so known at month end
+distillate,product_supplied_weekly,EIA Weekly Petroleum Status Report,WDIUPUS2,Distillate fuel oil product supplied (weekly estimate),kb/d,weekly,Friday ending the week,Wednesday after the week
+distillate,stocks,EIA Weekly Petroleum Status Report,WDISTUS1,Distillate fuel oil stocks (context only),thousand barrels,weekly,Friday ending the week,Wednesday after the week
+distillate,ind,Federal Reserve G.17 via FRED,INDPRO,Industrial production total index (seasonally adjusted),index 2017=100,monthly,1st of the month,mid following month
+distillate,ind_manuf,Federal Reserve G.17 via FRED,IPMAN,Industrial production manufacturing (seasonally adjusted),index 2017=100,monthly,1st of the month,mid following month
+distillate,truck,ATA Truck Tonnage via BTS and FRED,TRUCKD11,Truck tonnage index (seasonally adjusted),index 2015=100,monthly,1st of the month,about two months after the month
+distillate,cpi,BLS Consumer Price Index via FRED,CPIAUCSL,CPI all urban consumers all items (seasonally adjusted),index 1982-84=100,monthly,1st of the month,mid following month
+distillate,hdd,NOAA Climate Prediction Center,monthly states archive,US heating degree days weighted by population,degree days,monthly,month,first days of the following month
+distillate,hdd_oil,NOAA Climate Prediction Center,monthly states archive,US heating degree days weighted by homes heated with fuel oil,degree days,monthly,month,first days of the following month
+bunker,demand,MPA Singapore via data.gov.sg,d_4f5abbf4486bf8e52bbed3be56dde562,Bunker sales summed over the six fuel-oil grades,kt/month stored as kt/d,monthly,month,mid following month
+bunker,bunker_calls,MPA Singapore via data.gov.sg,d_48cb38d12697d3463c8cadfb22e6c61d,Vessel calls for bunkers,number of calls,monthly,month,mid following month
+bunker,bunker_calls_gt,MPA Singapore via data.gov.sg,d_48cb38d12697d3463c8cadfb22e6c61d,Gross tonnage of vessels calling for bunkers,thousand GT,monthly,month,mid following month
+bunker,cargo,MPA Singapore via data.gov.sg,d_042dd8b935eab998f389adaf559c80de,Total cargo throughput,thousand tonnes,monthly,month,mid following month
+bunker,tankers,MPA Singapore via data.gov.sg,d_9adb5ace517591edd9a8c88291ac1f1c,Tanker arrivals,number of vessels,monthly,month,mid following month
+bunker,wtr,CPB World Trade Monitor,tgz_w1_qnmi_sn,World merchandise trade volume (seasonally adjusted),index,monthly,month,around the 25th of the second month after

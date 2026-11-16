@@ -10,7 +10,7 @@ Demand is published `lag` months late (2 for EIA, 1 for MPA), so the newest prin
 d(t - lag); the drivers were aligned point-in-time in data.py. Nothing is scaled: a tree splits
 on thresholds, and a monotone rescaling leaves every split where it is.
 
-    python -m src.model    # the backtests, driver ablation and seed band, into results/
+    python -m src.model    # the backtests, driver ablation and seed band, into DuckDB
 """
 
 import math
@@ -19,9 +19,10 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
-from src import config as c, data
+from src import config as c, data, sql
 
 HORIZON = 12
+FORECASTS = ["xgboost", "naive", "last"]  # the model and its two free benchmarks
 
 PARAMS = dict(objective="reg:squarederror", subsample=0.8, colsample_bytree=0.8,
               random_state=42, n_jobs=4, verbosity=0)
@@ -68,7 +69,7 @@ def cv_score(X, y, step, lag, params, folds=3):
     errors = []
     for a, b in zip(edges[1:-1], edges[2:]):
         fit = X.index + pd.DateOffset(months=step + lag) <= X.index[a]
-        model = XGBRegressor(**PARAMS, **params).fit(X[fit], y[fit])
+        model = XGBRegressor(**{**PARAMS, **params}).fit(X[fit], y[fit])
         errors.append(np.mean((y.iloc[a:b] - model.predict(X.iloc[a:b])) ** 2))
     return np.mean(errors)
 
@@ -78,6 +79,13 @@ def tune(df, lag, origin):
     X, y = features(df, lag, HORIZON)
     rows = trainable(y, HORIZON, lag, origin)
     return min(GRID, key=lambda p: cv_score(X[rows], y[rows], HORIZON, lag, p))
+
+
+def tuned(product):
+    """The parameters the backtest chose for one product, read back from DuckDB."""
+    row = sql.query(f"SELECT * FROM params WHERE product = '{product}'").iloc[0]
+    return {"learning_rate": float(row["learning_rate"]), "max_depth": int(row["max_depth"]),
+            "n_estimators": int(row["n_estimators"])}
 
 
 def seasonal_naive(df, lag, origin):
@@ -94,18 +102,18 @@ def forecast(df, lag, origin, params):
     for step in range(1, HORIZON + 1):
         X, y = features(df, lag, step)
         rows = trainable(y, step, lag, origin)
-        fit = XGBRegressor(**PARAMS, **params).fit(X[rows], y[rows])
+        fit = XGBRegressor(**{**PARAMS, **params}).fit(X[rows], y[rows])
         deviation.append(fit.predict(X.loc[[origin]])[0])
     return seasonal_naive(df, lag, origin) * np.exp(deviation)
 
 
 def backtest(df, lag, params=None, origins=None):
-    """Forecast from every month end since BACKTEST_START. Parameters are tuned once, on what was
-    published by the first origin, so the backtest years play no part in choosing them. Passing
-    params and fewer origins reruns the same test cheaply, for the driver ablation."""
+    """Walk forward: forecast from every month end since BACKTEST_START, each time refitting on
+    what was published by then. Parameters are tuned once, on what was published by the first
+    origin, so the backtest years play no part in choosing them. Passing params and fewer
+    origins reruns the same test cheaply, for the driver ablation."""
     if origins is None:
         origins = pd.date_range(c.BACKTEST_START, df["demand"].last_valid_index(), freq="MS")
-    origins = origins[~origins.year.isin(c.EXCLUDE_YEARS)]
     params, rows = params or tune(df, lag, origins[0]), []
     for origin in origins:
         path = forecast(df, lag, origin, params)
@@ -113,45 +121,66 @@ def backtest(df, lag, params=None, origins=None):
         rows.append(pd.DataFrame({
             "origin": origin, "step": range(1, HORIZON + 1), "reference": reference,
             "actual": df["demand"].reindex(path.index).to_numpy(),
-            "xgboost": path.to_numpy(), "naive": seasonal_naive(df, lag, origin).to_numpy()},
+            "xgboost": path.to_numpy(), "naive": seasonal_naive(df, lag, origin).to_numpy(),
+            # the other free benchmark: the latest print published at the origin, held flat
+            "last": df.loc[origin - pd.DateOffset(months=lag), "demand"]},
             index=path.index.rename("month")))
-    return pd.concat(rows), params
+    return pd.concat(rows).reset_index(), params
 
 
-def score(bt):
-    """MAPE by horizon, XGBoost against the seasonal naive, on target months already published
-    with neither the target nor its naive reference in an excluded year."""
-    bt = bt[bt["actual"].notna() & ~bt.index.year.isin(c.EXCLUDE_YEARS)
-            & ~bt["reference"].dt.year.isin(c.EXCLUDE_YEARS)]
-    ape = 100 * bt[["xgboost", "naive"]].sub(bt["actual"], axis=0).abs().div(bt["actual"], axis=0)
-    return ape.groupby(bt["step"]).mean()
+def scored(bt, covid=False):
+    """The forecasts that can be marked: target already published and, unless covid is True, no
+    origin, target or naive reference month in an excluded year."""
+    bt = bt[bt["actual"].notna()]
+    if covid:
+        return bt
+    years = pd.DataFrame({"origin": bt["origin"].dt.year, "month": bt["month"].dt.year,
+                          "reference": bt["reference"].dt.year})
+    return bt[~years.isin(c.EXCLUDE_YEARS).any(axis=1)]
+
+
+def score(bt, by="step"):
+    """Each forecast against the actual, by horizon unless told otherwise. MAE and RMSE in the
+    unit of demand, WAPE (sum of absolute errors over sum of actuals) and bias (mean error over
+    mean actual) in %."""
+    error = bt[FORECASTS].sub(bt["actual"], axis=0)
+    actual = bt["actual"].groupby(bt[by])
+    return pd.concat({
+        "mae": error.abs().groupby(bt[by]).mean(),
+        "rmse": (error ** 2).groupby(bt[by]).mean() ** 0.5,
+        "wape": 100 * error.abs().groupby(bt[by]).sum().div(actual.sum(), axis=0),
+        "bias": 100 * error.groupby(bt[by]).sum().div(actual.sum(), axis=0)}, axis=1)
+
+
+def wape(bt):
+    """One number per forecast: WAPE in %, averaged over the twelve horizons."""
+    return score(scored(bt))["wape"].mean()
 
 
 if __name__ == "__main__":
-    # About 45 minutes, so notebook 02 reads the csv files instead. Rerun when the model changes.
-    c.RESULTS.mkdir(exist_ok=True)
-    tuned, ablation, seeds = {}, {}, {}
+    # About 50 minutes, so notebook 02 reads the tables instead. Rerun when the data or the
+    # model change.
+    backtests, chosen, ablation, seeds = [], [], [], []
     for product, lag in c.DEMAND_LAG.items():
         print(product)
         df = data.dataset(product)
         bt, params = backtest(df, lag)
-        bt.to_csv(c.RESULTS / f"backtest_{product}.csv")
-        tuned[product] = params
+        backtests.append(bt.assign(product=product))
+        chosen.append({"product": product, **params})
         # one origin a quarter, every calendar season: the full backtest at a quarter of the cost.
         # Lags only, then one driver dropped at a time, same hyperparameters
         quarterly = pd.date_range(c.BACKTEST_START, df["demand"].last_valid_index(), freq="3MS")
         variants = {"all drivers": df, "lags only": df[["demand"]]}
         variants |= {f"without {x}": df.drop(columns=x) for x in df.columns.drop("demand")}
         for name, frame in variants.items():
-            mape = score(backtest(frame, lag, params, quarterly)[0]).mean()
-            ablation[(product, name)] = mape["xgboost"]
-        ablation[(product, "seasonal naive")] = mape["naive"]
+            result = wape(backtest(frame, lag, params, quarterly)[0])
+            ablation.append({"product": product, "variant": name, "wape": result["xgboost"]})
+        ablation.append({"product": product, "variant": "seasonal naive", "wape": result["naive"]})
         # how much the score moves for no reason: same features, other seeds
         for seed in (1, 2, 3):
-            PARAMS["random_state"] = seed
-            mape = score(backtest(df, lag, params, quarterly)[0]).mean()
-            seeds[(product, seed)] = mape["xgboost"]
-        PARAMS["random_state"] = 42
-    pd.DataFrame(tuned).T.to_csv(c.RESULTS / "params.csv")
-    pd.Series(ablation).unstack(0).to_csv(c.RESULTS / "ablation.csv")
-    pd.Series(seeds).unstack(0).to_csv(c.RESULTS / "seeds.csv")
+            result = wape(backtest(df, lag, {**params, "random_state": seed}, quarterly)[0])
+            seeds.append({"product": product, "seed": seed, "wape": result["xgboost"]})
+    sql.write("backtest", pd.concat(backtests, ignore_index=True))
+    sql.write("params", pd.DataFrame(chosen))
+    sql.write("ablation", pd.DataFrame(ablation))
+    sql.write("seeds", pd.DataFrame(seeds))

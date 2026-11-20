@@ -2,14 +2,14 @@
 
     python -m src.data   ->  table panel: one row per product, month and driver, with the value
                              readable at that month end and the two dates that prove it
-    dataset("gasoline")  ->  the same panel as a frame, one row per month: demand, then drivers
+    dataset("jet")       ->  the same panel as a frame, one row per month: demand, then drivers
 
 Every driver observation carries two dates. period_end is the last day of the period the number
-describes; available_at is the day it was published, period_end plus the source's lag. Truck
-tonnage for July is not out until October and must not appear in an August or September row,
-so the join is merge_asof backward on available_at: as of each month end, the most recent value
-already published. Drivers become step functions rather than smooth lines, which costs a tree
-nothing.
+describes; available_at is the day it was published. Japan's customs figures for March are out
+at the end of April and must not appear in a March row, so the join is merge_asof backward on
+available_at: as of each month end, the most recent value already published. The burn index is
+daily and readable the day after: a month end carries its mean over the 28 days to the day
+before.
 
 The lags are release-calendar conventions applied to today's figures. They stop a number from
 being used before it existed; they do not undo later revisions, because the sources publish no
@@ -30,35 +30,41 @@ def demand(product):
 
 
 def predictors(product):
-    """Each driver as a series at its own frequency, indexed by period_end. Exports and stocks
-    stay in the database as supply-side context and are not fed to the model."""
+    """Each driver as a series at its own frequency, indexed by period_end. The context series
+    stay in the database and are not fed to the model."""
     df = sql.query(f"SELECT variable, period_end, value FROM predictors "
-                   f"WHERE product = '{product}' AND variable NOT IN ('exports', 'stocks')")
+                   f"WHERE product = '{product}' AND variable NOT IN {tuple(c.CONTEXT)}")
     df["period_end"] = pd.to_datetime(df["period_end"])
     series = {name: s.set_index("period_end")["value"].sort_index()
               for name, s in df.groupby("variable")}
-    if product in ("gasoline", "distillate"):
-        # USD/gal in 1982-84 dollars, the CPI base
-        series["real_price"] = series.pop("retail_price") / series.pop("cpi") * 100
-        # one week is noisy: EIA itself reports the four-week average
-        series["product_supplied_4wk"] = series.pop("product_supplied_weekly").rolling("28D").mean()
+    if "burn" in series:
+        # a day OpenSky lost data for is missing, not low; one day is noisy, 28 make a month
+        burn = series["burn"].asfreq("D")
+        for start, end in c.OPENSKY_OUTAGES:
+            burn[pd.Timestamp(start).normalize():pd.Timestamp(end).normalize()] = None
+        series["burn"] = burn.rolling("28D", min_periods=c.BURN_MIN_DAYS).mean()
     return series
+
+
+def origins(product):
+    """The forecast origins: every month from SAMPLE_START to the month end by which the last
+    demand figure was published."""
+    last = demand(product).index.max() + pd.DateOffset(months=c.DEMAND_LAG[product])
+    months = pd.DataFrame({"month": pd.date_range(c.SAMPLE_START, last, freq="MS")})
+    # the forecast origin: whatever was published by the last day of the month
+    months["month_end"] = months["month"] + pd.offsets.MonthEnd(0)
+    return months
 
 
 def align(product):
     """Every driver as it was readable at each month end, in long form, on a complete monthly
-    index so a gap in a source shows as a missing value and not as a missing row. The index
-    runs to the latest origin: the month end by which the last demand figure was published."""
-    last_origin = demand(product).index.max() + pd.DateOffset(months=c.DEMAND_LAG[product])
-    months = pd.DataFrame({"month": pd.date_range(c.SAMPLE_START, last_origin, freq="MS")})
-    # the forecast origin: whatever was published by the last day of the month
-    months["month_end"] = months["month"] + pd.offsets.MonthEnd(0)
-
+    index so a gap in a source shows as a missing value and not as a missing row."""
+    months = origins(product)
     frames = []
     for name, s in predictors(product).items():
         s = s.dropna().rename("value").reset_index()
-        if name == "product_supplied_4wk":
-            s["available_at"] = s["period_end"] + pd.Timedelta(days=c.WEEKLY_LAG_DAYS)
+        if name == "burn":
+            s["available_at"] = s["period_end"] + pd.Timedelta(days=c.BURN_LAG_DAYS)
         else:
             s["available_at"] = s["period_end"] + pd.offsets.MonthEnd(c.LAG[name])
         s = s.sort_values("available_at")
@@ -66,6 +72,10 @@ def align(product):
                            direction="backward", tolerance=pd.Timedelta(days=c.STALE_DAYS))
         df.insert(0, "variable", name)
         frames.append(df)
+    if not frames:  # no driver yet: an empty panel with the same columns and types
+        empty = months.iloc[:0].assign(period_end=pd.NaT, value=float("nan"), available_at=pd.NaT)
+        empty.insert(0, "variable", "")
+        frames = [empty]
     df = pd.concat(frames, ignore_index=True)
     df.insert(0, "product", product)
     return df
@@ -75,15 +85,18 @@ def dataset(product):
     """The stored panel of one product as the modelling frame: demand, then every driver as
     readable at that month end. Trailing rows without demand are the latest forecast origins."""
     panel = sql.query(f"SELECT month, variable, value FROM panel WHERE product = '{product}'")
-    df = panel.pivot(index="month", columns="variable", values="value")
+    drivers = panel.pivot(index="month", columns="variable", values="value")
+    df = pd.DataFrame(index=pd.DatetimeIndex(origins(product)["month"], name="month"))
+    df["demand"] = demand(product)["demand"]
+    df = df.join(drivers)
     df.columns.name = None
-    df.insert(0, "demand", demand(product)["demand"])
     return df
 
 
 def build():
     """Align every product and store the result as the table panel."""
-    panel = pd.concat([align(product) for product in c.DEMAND_LAG], ignore_index=True)
+    frames = [align(product) for product in c.DEMAND_LAG]
+    panel = pd.concat([df for df in frames if not df.empty], ignore_index=True)
     sql.write("panel", panel)
     return sql.query("SELECT product, COUNT(DISTINCT variable) AS drivers, MIN(month) AS first, "
                      "MAX(month) AS last, COUNT(*) AS rows FROM panel GROUP BY 1 ORDER BY 1")

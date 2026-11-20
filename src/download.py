@@ -1,52 +1,44 @@
-"""Fetch the raw inputs into data/, one folder per product. No source needs a key.
+"""Fetch the raw inputs into data/, one folder per product. Only OpenSky needs an account.
 
-    python -m src.download            # everything
-    python -m src.download eia mpa    # only these
+    python -m src.download                  # everything
+    python -m src.download eia customs      # only these
 
-Requests go through curl rather than urllib: FRED sits behind a CDN that hangs up on Python's
-TLS handshake, while curl on the same URL answers in half a second.
+Requests go through curl rather than urllib: some of these servers hang up on Python's TLS
+handshake, while curl on the same URL answers in half a second.
+
+OpenSky's historical flights come from its Trino database, one UTC day per query and one query
+at a time (the limit is two), filtered on the day partition. The login stays in pyopensky's own
+configuration file, never here. A day already on file is not asked for again.
 """
 
+import html
 import io
-import json
 import re
 import subprocess
 import sys
-import time
+import zipfile
 
 import pandas as pd
 
-from src import config as c
+from src import config as c, flights
 
-CURL = ["curl", "-sS", "-L", "--retry", "3", "--max-time", "900"]
+CURL = ["curl", "-sS", "-L", "--retry", "3", "--max-time", "900", "-A", "Mozilla/5.0"]
 
-# EIA id -> column, per product and frequency. Product supplied and exports in kb/d,
-# stocks in thousand barrels, retail price in USD/gal. The monthly product supplied is the target;
-# the weekly one is the same concept a week after the fact, so it covers the months the monthly
-# has not reached yet. Same column names for both products, so the code downstream is shared.
-EIA = {c.GASOLINE: {"monthly": {"MGFUPUS2": "product_supplied", "MGFEXUS2": "exports",
-                                "EMM_EPMR_PTE_NUS_DPG": "retail_price"},
-                    "weekly": {"WGFUPUS2": "product_supplied", "WGTSTUS1": "stocks"}},
-       c.DISTILLATE: {"monthly": {"MDIUPUS2": "product_supplied", "MDIEXUS2": "exports",
-                                  "EMD_EPD2D_PTE_NUS_DPG": "retail_price"},
-                      "weekly": {"WDIUPUS2": "product_supplied", "WDISTUS1": "stocks"}}}
+# EIA id -> column. Kerosene-type jet fuel product supplied, kb/d: the monthly is the target, the
+# weekly the same concept a week after the fact, kept as the yardstick of the burn index
+EIA = {"monthly": {"MKJUPUS2": "product_supplied"}, "weekly": {"WKJUPUS2": "product_supplied"}}
 
-# FRED id -> column, per product, all monthly: one request each, since mixed frequencies come
-# back as a zip. The CPI deflates the retail prices.
-FRED = {c.GASOLINE: {"TRFVOLUSM227NFWA": "vmt", "PAYEMS": "payrolls", "DSPIC96": "inc",
-                     "CPIAUCSL": "cpi"},
-        c.DISTILLATE: {"INDPRO": "ind", "IPMAN": "ind_manuf", "TRUCKD11": "truck",
-                       "CPIAUCSL": "cpi"}}
+JODI = "https://www.jodidata.org/_resources/files/downloads/oil-data/world_secondary_csv.zip"
 
-NOAA = ("https://ftp.cpc.ncep.noaa.gov/htdocs/products/analysis_monitoring/cdus/degree_days/"
-        "archives/Heating%20degree%20Days/monthly%20states/")
+# e-Stat files of Japan's trade statistics: commodity by country, imports, one file a year
+# holding its months; chapters 25-27 are table 5 of 22
+ESTAT = ("https://www.e-stat.go.jp/stat-search/files?page=1&layout=datalist&data=1&metadata=1"
+         "&cycle=1&toukei=00350300&tstat=000001013141&tclass1=000001013180&tclass2=000001013182"
+         "&cycle_facet=cycle&tclass3val=0&year=")
+ESTAT_FILE = "https://www.e-stat.go.jp/stat-search/file-download?fileKind=1&statInfId="
 
-# MPA datasets on data.gov.sg, monthly: sales by fuel grade (kt), vessel calls by purpose,
-# total cargo throughput (kt), tanker arrivals
-MPA = {"bunker_sales": "d_4f5abbf4486bf8e52bbed3be56dde562",
-       "vessel_calls": "d_48cb38d12697d3463c8cadfb22e6c61d",
-       "cargo": "d_042dd8b935eab998f389adaf559c80de",
-       "tankers": "d_9adb5ace517591edd9a8c88291ac1f1c"}
+AIRCRAFT = ("https://s3.opensky-network.org/data-samples/metadata/"
+            "aircraft-database-complete-2025-08.csv")
 
 
 def get(url):
@@ -56,74 +48,118 @@ def get(url):
 def eia():
     """EIA history files are .xls with one series each, named <id>m or <id>w, dated mid-month or
     on the Friday that ends the week."""
-    for folder, frequencies in EIA.items():
-        for freq, series in frequencies.items():
-            columns = []
-            for code, column in series.items():
-                url = f"https://www.eia.gov/dnav/pet/hist_xls/{code}{freq[0]}.xls"
-                book = pd.read_excel(io.BytesIO(get(url)), sheet_name="Data 1", header=2)
-                columns.append(book.set_axis(["date", column], axis=1).set_index("date")[column])
-            pd.concat(columns, axis=1, sort=True).to_csv(folder / f"eia_{freq}.csv")
+    for freq, series in EIA.items():
+        columns = []
+        for code, column in series.items():
+            url = f"https://www.eia.gov/dnav/pet/hist_xls/{code}{freq[0]}.xls"
+            book = pd.read_excel(io.BytesIO(get(url)), sheet_name="Data 1", header=2)
+            columns.append(book.set_axis(["date", column], axis=1).set_index("date")[column])
+        pd.concat(columns, axis=1, sort=True).to_csv(c.JET / f"eia_{freq}.csv")
 
 
-def fred():
-    for folder, series in FRED.items():
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=" + ",".join(series)
-        df = pd.read_csv(io.BytesIO(get(url)), na_values=".")
-        df.columns = ["date"] + [series[s] for s in df.columns[1:]]
-        df.to_csv(folder / "fred.csv", index=False)
-
-
-def noaa():
-    """US heating degree days, weighted by population and by homes heated with fuel oil. One
-    text file per month since mid-1997; old file names are irregular, so the month is read off
-    the header. The national lines come in a fixed order: population, gas, oil, electric."""
+def jodi():
+    """Total demand (TOTDEMO) of naphtha and LPG in Korea and Japan, in kb/d and in the
+    kilotonnes they are reported in, and Japan's naphtha imports (TOTIMPSB), from JODI's world
+    database, which republishes its whole history every month. Missing values come as '-', 'x'
+    or 'N/A'."""
+    archive = zipfile.ZipFile(io.BytesIO(get(JODI)))
     rows = []
-    for year in re.findall(r'href="(\d{4})/"', get(NOAA).decode()):
-        for name in re.findall(r'href="([^"]+\.txt)"', get(NOAA + year + "/").decode()):
-            text = get(NOAA + year + "/" + name).decode("latin-1")
-            us = [int(line.split()[2]) for line in text.splitlines()
-                  if line.strip().startswith("UNITED STATES")]
-            month = re.search(r"MONTHLY DATA FOR (\w{3} \d{4})", text).group(1)
-            rows.append({"month": month, "hdd": us[0], "hdd_oil": us[2]})
-    df = pd.DataFrame(rows)
-    df["month"] = pd.to_datetime(df["month"], format="%b %Y").dt.strftime("%Y-%m")
-    df = df.drop_duplicates("month").sort_values("month")
-    df.to_csv(c.DISTILLATE / "noaa_hdd.csv", index=False)
+    with archive.open(archive.namelist()[0]) as f:
+        for chunk in pd.read_csv(f, dtype=str, chunksize=1_000_000):
+            rows.append(chunk[chunk["REF_AREA"].isin(["KR", "JP"])
+                              & chunk["ENERGY_PRODUCT"].isin(["NAPHTHA", "LPG"])
+                              & chunk["FLOW_BREAKDOWN"].isin(["TOTDEMO", "TOTIMPSB"])
+                              & chunk["UNIT_MEASURE"].isin(["KBD", "KTONS"])])
+    df = pd.concat(rows)
+    demand = (df["FLOW_BREAKDOWN"] == "TOTDEMO") | ((df["REF_AREA"] == "JP")
+                                                   & (df["ENERGY_PRODUCT"] == "NAPHTHA")
+                                                   & (df["UNIT_MEASURE"] == "KTONS"))
+    df = df[demand].copy()
+    df["series"] = (df["ENERGY_PRODUCT"].str.lower() + "_" + df["REF_AREA"].str.lower()
+                    + df["FLOW_BREAKDOWN"].map({"TOTDEMO": "", "TOTIMPSB": "_imports"})
+                    + df["UNIT_MEASURE"].map({"KBD": "", "KTONS": "_kt"}))
+    df["value"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
+    wide = df.pivot(index="TIME_PERIOD", columns="series", values="value")
+    wide.rename_axis("month").to_csv(c.NAPHTHA / "jodi.csv")
 
 
-def mpa():
-    """Singapore port statistics, kept as published. data.gov.sg serves each csv through a
-    signed link once prepared, and without a key it allows a few calls a minute."""
-    for name, dataset in MPA.items():
-        api = f"https://api-open.data.gov.sg/v1/public/api/datasets/{dataset}/"
-        get(api + "initiate-download")
-        for _ in range(10):
-            time.sleep(20)
-            poll = json.loads(get(api + "poll-download"))["data"] or {}  # None when rate-limited
-            if "url" in poll:
-                break
-        (c.BUNKER / f"mpa_{name}.csv").write_bytes(get(poll["url"]))
+def customs():
+    """Japan's imports of naphtha, propane and butane by country and month, kg or tonnes and
+    thousand yen, from the year files on e-Stat. Past years are the definitive figures, the
+    current year the latest release: final months, then the newest as a preliminary 9-digit
+    figure. Each file's publication date is kept next to it."""
+    rows, releases = [], []
+    for year in range(2009, pd.Timestamp.now().year + 1):
+        page = get(ESTAT + f"{year}0").decode("utf-8")
+        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", page)))
+        # the title of table 5 and its publication date
+        pattern = (r"(\d{4}年(?:\d+月)?分 品別国別表 \([^)]*\) \S+ 25-27類) 調査年月 \S+ "
+                   r"公開（更新）日 (\d{4}-\d{2}-\d{2})")
+        title, published = re.search(pattern, text).groups()
+        ids = re.findall(r"statInfId=(\d+)&(?:amp;)?fileKind=1", page)
+        file_id = ids[4]  # the fifth table: chapters 25-27
+        book = pd.read_csv(io.BytesIO(get(ESTAT_FILE + file_id)), dtype={"HS": str})
+        book["HS"] = book["HS"].str.strip("'")
+        book = book[book["HS"].isin(list(c.CUSTOMS))]
+        # after the year totals, three columns a month: quantity 1, quantity 2, value. Read by
+        # position: older files spell April "Apl"
+        for month in range(1, 13):
+            first = 9 + 3 * (month - 1)
+            rows.append(pd.DataFrame({"month": f"{year}-{month:02d}", "code": book["HS"],
+                                      "country": book["Country"], "unit": book["Unit2"],
+                                      "quantity": book.iloc[:, first + 1],
+                                      "value": book.iloc[:, first + 2]}))
+        releases.append({"year": year, "title": title, "published": published,
+                         "statInfId": file_id})
+    df = pd.concat(rows)
+    df = df[(df["quantity"] > 0) | (df["value"] > 0)]  # a month not yet out is all zeros
+    df.to_csv(c.NAPHTHA / "customs.csv", index=False)
+    pd.DataFrame(releases).to_csv(c.NAPHTHA / "customs_releases.csv", index=False)
 
 
-def cpb():
-    """World merchandise trade volume. The workbook name carries its vintage, so the link is
-    read off the page; the one row used is kept as csv."""
-    page = get("https://www.cpb.nl/en/worldtrademonitor/latest").decode("utf-8", "ignore")
-    href = re.search(r'href="([^"]*world-trade-monitor[^"]*\.xlsx)"', page, re.I).group(1)
-    book = pd.read_excel(io.BytesIO(get("https://www.cpb.nl" + href)), sheet_name="trade_out",
-                         header=None)
-    months = book.iloc[3, 5:].astype(str).str.replace("m", "-")
-    # by series code: the label "World trade" is on the price row as well as the volume row
-    volume = book[book[2] == "tgz_w1_qnmi_sn"].iloc[0, 5:].astype(float)
-    df = pd.DataFrame({"month": months.to_numpy(), "wtr": volume.to_numpy()})
-    df.to_csv(c.BUNKER / "cpb_world_trade.csv", index=False)
+def aircraft():
+    """OpenSky's aircraft database, the rows of the commercial jet types: icao24 to type code.
+    One snapshot, August 2025, used for every year."""
+    df = pd.read_csv(io.BytesIO(get(AIRCRAFT)), quotechar="'", dtype=str,
+                     usecols=["icao24", "typecode", "model", "operator", "registration"])
+    df = df[df["typecode"].isin(list(c.COMMERCIAL_JETS))]
+    df.to_csv(c.JET / "aircraft.csv", index=False)
 
 
-SOURCES = {"eia": eia, "fred": fred, "noaa": noaa, "mpa": mpa, "cpb": cpb}
+def opensky():
+    """The day's flights touching a US airport, by commercial type, one file per month. Needs a
+    Trino account in pyopensky's settings file. Newest day first, so a rerun picks up where the
+    last one stopped; it stops at the first day OpenSky returns no flight for, the edge of what
+    it holds. The days of its documented outages are not asked for: they are dropped anyway."""
+    from pyopensky.trino import Trino
+    trino = Trino()
+    aircraft = pd.read_csv(c.JET / "aircraft.csv", dtype=str)
+    table = pd.read_csv(flights.FUEL_TABLE)
+    folder = c.JET / "opensky"
+    folder.mkdir(exist_ok=True)
+    lost = {day for start, end in c.OPENSKY_OUTAGES
+            for day in pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize())}
+    yesterday = pd.Timestamp.now().normalize() - pd.Timedelta(days=1)
+    for day in pd.date_range(c.OPENSKY_START, yesterday - pd.Timedelta(days=1))[::-1]:
+        path = folder / f"{day:%Y-%m}.csv"
+        if day in lost or (path.exists() and f"{day:%Y-%m-%d}" in pd.read_csv(path)["day"].values):
+            continue
+        rows = trino.query(flights.query(day), cached=False)
+        if rows.empty:
+            print(f"{day:%Y-%m-%d}: no flight returned, stopping")
+            break
+        df = flights.burn(rows, aircraft, table)
+        df.insert(0, "day", f"{day:%Y-%m-%d}")
+        df.to_csv(path, mode="a", header=not path.exists(), index=False)
+        print(f"{day:%Y-%m-%d}: {len(rows):,} flights, {df['departures'].sum():,} departures",
+              flush=True)
+
+
+SOURCES = {"eia": eia, "jodi": jodi, "customs": customs, "aircraft": aircraft,
+           "opensky": opensky}
 
 if __name__ == "__main__":
-    for folder in (c.GASOLINE, c.DISTILLATE, c.BUNKER):
+    for folder in (c.JET, c.NAPHTHA):
         folder.mkdir(parents=True, exist_ok=True)
     for name in sys.argv[1:] or SOURCES:
         print(name)

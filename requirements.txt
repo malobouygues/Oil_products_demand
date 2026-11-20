@@ -4,6 +4,7 @@ duckdb
 matplotlib
 xgboost
 scikit-learn      # XGBRegressor is XGBoost's sklearn-compatible estimator and needs it
-openpyxl          # the CPB world trade monitor is only published as .xlsx
 xlrd              # EIA history files are old-format .xls
-jupyterlab        # to run the two notebooks
+openap            # fuel flow by aircraft type, for the burn index
+pyopensky         # OpenSky's Trino database; the login stays in its own settings file
+jupyterlab        # to run the four notebooks

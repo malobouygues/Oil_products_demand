@@ -6,11 +6,11 @@ model predicts what it misses, y = log demand(t + step) - log naive, so a tree n
 extrapolate a trend it has not seen, and beating the naive is the objective itself. The
 forecast is the naive times exp(prediction).
 
-Demand is published `lag` months late (2 for EIA, 1 for MPA), so the newest print at t is
+Demand is published `lag` months late (2 for EIA and JODI), so the newest print at t is
 d(t - lag); the drivers were aligned point-in-time in data.py. Nothing is scaled: a tree splits
 on thresholds, and a monotone rescaling leaves every split where it is.
 
-    python -m src.model    # the backtests, driver ablation and seed band, into DuckDB
+    python -m src.model    # the backtests, the driver ablation and the seed band, by horizon
 """
 
 import math
@@ -39,27 +39,36 @@ def back(step, lag):
 
 def features(df, lag, step):
     """X at origin t, in year-on-year terms: the last twelve published demand prints and every
-    driver as of t, each against its value a year earlier (degree days as a difference, they
-    can be zero). y: log demand at t + step over the seasonal naive."""
+    driver as of t, each against its value a year earlier. y: log demand at t + step over the
+    seasonal naive."""
     d = np.log(df["demand"])
     X = pd.DataFrame({f"yoy_lag{k}": d.shift(k) - d.shift(k + 12) for k in range(lag, lag + 12)})
     for name in df.columns.drop("demand"):
-        if name.startswith("hdd"):
-            X[name] = df[name] - df[name].shift(12)
-        else:
-            X[name] = np.log(df[name] / df[name].shift(12))
+        X[name] = np.log(df[name] / df[name].shift(12))
+    if "propane_naphtha" in df:
+        # crackers switch feed past a threshold, propane some 50 USD/t under naphtha: the level
+        X["propane_naphtha_level"] = df["propane_naphtha"]
     return X, d.shift(-step) - d.shift(back(step, lag) - step)
 
 
-def trainable(y, step, lag, origin):
+def excluded(months, product):
+    """Whether each month falls in one of the product's shocks: 2020, and Hormuz for naphtha."""
+    months = pd.DatetimeIndex(months)
+    return np.any([(months >= start) & (months <= end) for start, end in c.EXCLUDE[product]],
+                  axis=0)
+
+
+def trainable(y, step, product, origin):
     """Origins from TRAIN_START whose target had been published by the forecast origin, with
-    neither the origin, the target nor its naive reference month in an excluded year."""
+    neither the origin, the target nor its naive reference month in one of the product's
+    shocks."""
+    lag = c.DEMAND_LAG[product]
     target = y.index + pd.DateOffset(months=step)
     published = target + pd.DateOffset(months=lag) <= pd.Timestamp(origin)
     reference = target - pd.DateOffset(months=back(step, lag))
-    excluded = (y.index.year.isin(c.EXCLUDE_YEARS) | target.year.isin(c.EXCLUDE_YEARS)
-                | reference.year.isin(c.EXCLUDE_YEARS))
-    return (y.index >= c.TRAIN_START) & published & y.notna() & ~excluded
+    shock = (excluded(y.index, product) | excluded(target, product)
+             | excluded(reference, product))
+    return (y.index >= c.TRAIN_START) & published & y.notna() & ~shock
 
 
 def cv_score(X, y, step, lag, params, folds=3):
@@ -74,10 +83,11 @@ def cv_score(X, y, step, lag, params, folds=3):
     return np.mean(errors)
 
 
-def tune(df, lag, origin):
+def tune(df, product, origin):
     """Parameters chosen at the longest step and reused for the shorter ones."""
+    lag = c.DEMAND_LAG[product]
     X, y = features(df, lag, HORIZON)
-    rows = trainable(y, HORIZON, lag, origin)
+    rows = trainable(y, HORIZON, product, origin)
     return min(GRID, key=lambda p: cv_score(X[rows], y[rows], HORIZON, lag, p))
 
 
@@ -96,27 +106,28 @@ def seasonal_naive(df, lag, origin):
     return pd.Series(df.loc[reference, "demand"].to_numpy(), index=months)
 
 
-def forecast(df, lag, origin, params):
+def forecast(df, product, origin, params):
     """Demand at t+1 ... t+12 from origin t, one model per step."""
+    lag = c.DEMAND_LAG[product]
     origin, deviation = pd.Timestamp(origin), []
     for step in range(1, HORIZON + 1):
         X, y = features(df, lag, step)
-        rows = trainable(y, step, lag, origin)
+        rows = trainable(y, step, product, origin)
         fit = XGBRegressor(**{**PARAMS, **params}).fit(X[rows], y[rows])
         deviation.append(fit.predict(X.loc[[origin]])[0])
     return seasonal_naive(df, lag, origin) * np.exp(deviation)
 
 
-def backtest(df, lag, params=None, origins=None):
+def backtest(df, product, params=None):
     """Walk forward: forecast from every month end since BACKTEST_START, each time refitting on
     what was published by then. Parameters are tuned once, on what was published by the first
-    origin, so the backtest years play no part in choosing them. Passing params and fewer
-    origins reruns the same test cheaply, for the driver ablation."""
-    if origins is None:
-        origins = pd.date_range(c.BACKTEST_START, df["demand"].last_valid_index(), freq="MS")
-    params, rows = params or tune(df, lag, origins[0]), []
+    origin, so the backtest years play no part in choosing them. Passing params reruns the same
+    test without tuning, for the driver ablation and the seeds."""
+    lag = c.DEMAND_LAG[product]
+    origins = pd.date_range(c.BACKTEST_START, df["demand"].last_valid_index(), freq="MS")
+    params, rows = params or tune(df, product, origins[0]), []
     for origin in origins:
-        path = forecast(df, lag, origin, params)
+        path = forecast(df, product, origin, params)
         reference = [m - pd.DateOffset(months=back(s, lag)) for s, m in enumerate(path.index, 1)]
         rows.append(pd.DataFrame({
             "origin": origin, "step": range(1, HORIZON + 1), "reference": reference,
@@ -125,18 +136,23 @@ def backtest(df, lag, params=None, origins=None):
             # the other free benchmark: the latest print published at the origin, held flat
             "last": df.loc[origin - pd.DateOffset(months=lag), "demand"]},
             index=path.index.rename("month")))
-    return pd.concat(rows).reset_index(), params
+    bt = pd.concat(rows).reset_index()
+    bt.insert(0, "product", product)
+    return bt, params
 
 
-def scored(bt, covid=False):
-    """The forecasts that can be marked: target already published and, unless covid is True, no
-    origin, target or naive reference month in an excluded year."""
+def scored(bt, shocks=False):
+    """The forecasts that can be marked: target already published and, unless shocks is True, no
+    origin, target or naive reference month in one of the product's shocks."""
     bt = bt[bt["actual"].notna()]
-    if covid:
+    if shocks:
         return bt
-    years = pd.DataFrame({"origin": bt["origin"].dt.year, "month": bt["month"].dt.year,
-                          "reference": bt["reference"].dt.year})
-    return bt[~years.isin(c.EXCLUDE_YEARS).any(axis=1)]
+    keep = []
+    for product, rows in bt.groupby("product"):
+        shock = (excluded(rows["origin"], product) | excluded(rows["month"], product)
+                 | excluded(rows["reference"], product))
+        keep.append(rows[~shock])
+    return pd.concat(keep)
 
 
 def score(bt, by="step"):
@@ -158,29 +174,38 @@ def wape(bt):
 
 
 if __name__ == "__main__":
-    # About 50 minutes, so notebook 02 reads the tables instead. Rerun when the data or the
-    # model change.
+    # About an hour, so notebooks 02 read the tables instead. Rerun when the data or the model
+    # change.
     backtests, chosen, ablation, seeds = [], [], [], []
-    for product, lag in c.DEMAND_LAG.items():
+    for product in c.DEMAND_LAG:
         print(product)
         df = data.dataset(product)
-        bt, params = backtest(df, lag)
-        backtests.append(bt.assign(product=product))
+        bt, params = backtest(df, product)
+        backtests.append(bt)
         chosen.append({"product": product, **params})
-        # one origin a quarter, every calendar season: the full backtest at a quarter of the cost.
-        # Lags only, then one driver dropped at a time, same hyperparameters
-        quarterly = pd.date_range(c.BACKTEST_START, df["demand"].last_valid_index(), freq="3MS")
-        variants = {"all drivers": df, "lags only": df[["demand"]]}
-        variants |= {f"without {x}": df.drop(columns=x) for x in df.columns.drop("demand")}
-        for name, frame in variants.items():
-            result = wape(backtest(frame, lag, params, quarterly)[0])
-            ablation.append({"product": product, "variant": name, "wape": result["xgboost"]})
-        ablation.append({"product": product, "variant": "seasonal naive", "wape": result["naive"]})
+        # two windows: every origin, and the origins where every driver has a year-on-year
+        # value, since a driver can start late (OpenSky's flights are online from 2023 only)
+        X = features(df, c.DEMAND_LAG[product], 1)[0]
+        drivers = X.drop(columns=X.filter(like="yoy_lag").columns).dropna()
+        windows = sorted({pd.Timestamp(c.BACKTEST_START),
+                          max(drivers.index.min(), pd.Timestamp(c.BACKTEST_START))})
+        # the drivers out, same hyperparameters, every origin: the error by horizon
+        variants = {"all drivers": bt}
+        if df.shape[1] > 1:
+            variants["lags only"] = backtest(df[["demand"]], product, params)[0]
         # how much the score moves for no reason: same features, other seeds
-        for seed in (1, 2, 3):
-            result = wape(backtest(df, lag, {**params, "random_state": seed}, quarterly)[0])
-            seeds.append({"product": product, "seed": seed, "wape": result["xgboost"]})
+        runs = {seed: backtest(df, product, {**params, "random_state": seed})[0]
+                for seed in (1, 2, 3)}
+        for since in windows:
+            for name, result in variants.items():
+                by_step = score(scored(result[result["origin"] >= since]))["wape"]
+                ablation.append(by_step.assign(product=product, variant=name, since=since)
+                                .reset_index())
+            for seed, result in runs.items():
+                by_step = score(scored(result[result["origin"] >= since]))["wape"]
+                seeds.append(by_step.assign(product=product, seed=seed, since=since)
+                             .reset_index())
     sql.write("backtest", pd.concat(backtests, ignore_index=True))
     sql.write("params", pd.DataFrame(chosen))
-    sql.write("ablation", pd.DataFrame(ablation))
-    sql.write("seeds", pd.DataFrame(seeds))
+    sql.write("ablation", pd.concat(ablation, ignore_index=True))
+    sql.write("seeds", pd.concat(seeds, ignore_index=True))

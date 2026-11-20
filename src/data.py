@@ -9,7 +9,7 @@ describes; available_at is the day it was published. Japan's customs figures for
 at the end of April and must not appear in a March row, so the join is merge_asof backward on
 available_at: as of each month end, the most recent value already published. The burn index is
 daily and readable the day after: a month end carries its mean over the 28 days to the day
-before.
+before, leaving out the days OpenSky lost (lost_days).
 
 The lags are release-calendar conventions applied to today's figures. They stop a number from
 being used before it existed; they do not undo later revisions, because the sources publish no
@@ -40,10 +40,26 @@ def predictors(product):
     if "burn" in series:
         # a day OpenSky lost data for is missing, not low; one day is noisy, 28 make a month
         burn = series["burn"].asfreq("D")
-        for start, end in c.OPENSKY_OUTAGES:
-            burn[pd.Timestamp(start).normalize():pd.Timestamp(end).normalize()] = None
+        burn = burn.mask(lost_days().reindex(burn.index, fill_value=False))
         series["burn"] = burn.rolling("28D", min_periods=c.BURN_MIN_DAYS).mean()
     return series
+
+
+def lost_days():
+    """The days of the burn index treated as missing: OpenSky's documented outages, and the days
+    whose own coverage says data were lost. Point-in-time: a day is judged on itself and on the
+    four weeks before it, all readable the next day."""
+    cover = sql.query("SELECT period_end, variable, value FROM predictors WHERE product = 'jet' "
+                      "AND variable IN ('flights', 'unknown_airport')")
+    cover = cover.pivot(index="period_end", columns="variable", values="value")
+    cover.index = pd.to_datetime(cover.index)
+    cover = cover.sort_index().asfreq("D")
+    usual = cover["flights"].rolling("28D", closed="left", min_periods=7).median()
+    lost = ((cover["flights"] < c.LOST_FLIGHTS * usual)
+            | (cover["unknown_airport"] > c.LOST_UNKNOWN))
+    for start, end in c.OPENSKY_OUTAGES:
+        lost[pd.Timestamp(start).normalize():pd.Timestamp(end).normalize()] = True
+    return lost
 
 
 def origins(product):

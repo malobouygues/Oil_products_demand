@@ -138,7 +138,8 @@ def opensky():
     folder = c.JET / "opensky"
     folder.mkdir(exist_ok=True)
     lost = {day for start, end in c.OPENSKY_OUTAGES
-            for day in pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize())}
+            for day in pd.date_range(pd.Timestamp(start).normalize(),
+                                     pd.Timestamp(end).normalize())}
     yesterday = pd.Timestamp.now().normalize() - pd.Timedelta(days=1)
     for day in pd.date_range(c.OPENSKY_START, yesterday - pd.Timedelta(days=1))[::-1]:
         path = folder / f"{day:%Y-%m}.csv"

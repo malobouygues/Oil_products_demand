@@ -94,6 +94,11 @@ OPENSKY_OUTAGES = [
     ("2023-11-20 01:00", "2023-11-20 03:00"), ("2023-12-02 08:00", "2023-12-05 03:00"),
     ("2024-05-20 10:00", "2024-05-21 05:00"), ("2026-01-02 19:00", "2026-01-03 18:00"),
     ("2026-01-24 08:00", "2026-01-24 17:00")]
+# and the days it degraded without saying so, read from the coverage of the day itself: fewer
+# than half the departures of the four weeks before, or more than 40% of its flights left
+# without an airport (22% at the median, 39% at the 99th percentile, 2023-2026)
+LOST_FLIGHTS = 0.5
+LOST_UNKNOWN = 0.4
 # OpenSky reprocessed its data from this date (decoder fixes): the airports it estimates may shift
 OPENSKY_REPROCESSED = "2026-08-13"
 # a month's index is a 28-day mean of the daily burn; it needs three weeks of days

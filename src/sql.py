@@ -138,7 +138,7 @@ def clean(con):
               AND value IS NOT NULL""")
 
     # Japan's imports by product, country and month: naphtha in kg, propane and butane in
-    # tonnes, values in thousand yen
+    # tonnes, values in thousand yen; DuckDB reads the frame codes by its name in the query
     codes = pd.DataFrame(list(c.CUSTOMS.items()), columns=["code", "product"])
     con.execute("""
         CREATE OR REPLACE TABLE imports AS
